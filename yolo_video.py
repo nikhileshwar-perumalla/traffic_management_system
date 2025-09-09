@@ -18,7 +18,7 @@ from atcs import traffic_control
 #All these classes will be counted as 'vehicles'
 list_of_vehicles = ["bicycle","car","motorbike","bus","truck"]
 # Setting the threshold for the number of frames to search a vehicle for
-FRAMES_BEFORE_CURRENT = 5
+FRAMES_BEFORE_CURRENT = 10
 inputWidth, inputHeight = 416, 416
 
 #Parse command line arguments and extract the values required
@@ -135,13 +135,17 @@ def count_vehicles(idxs, boxes, classIDs, vehicle_count, previous_frame_detectio
 	# ensure at least one detection exists
 	if len(idxs) > 0:
 		# loop over the indices we are keeping
-		for i in idxs.flatten():
+		for i in np.array(idxs).flatten():
 			# extract the bounding box coordinates
+			if i >= len(boxes) or i >= len(classIDs):
+				continue
 			(x, y) = (boxes[i][0], boxes[i][1])
 			(w, h) = (boxes[i][2], boxes[i][3])
+			if w <= 0 or h <= 0:
+				continue
 			
-			centerX = x + (w//2)
-			centerY = y+ (h//2)
+			centerX = int(x + (w//2))
+			centerY = int(y + (h//2))
 
 			# When the detection is in the list of vehicles, AND
 			# it crosses the line AND
@@ -249,18 +253,15 @@ def yolo_detection_counter(vehicle_count_instance,lane,inputVideoPath,outputVide
 
 			#Calculating fps each second
 			start_time, num_frames = displayFPS(start_time, num_frames)
-			# read the next frame from the file
-			(grabbed, framesaa) = videoStream.read()
-			frame = ''
-			for i in range(2):
-				if(fvs.more()):
-					frame = fvs.read()
-				else:
-					pass
-			#frame = fvs.read()
-			# if the frame was not grabbed, then we have reached the end of the stream
-			if not grabbed:
+			# Read next frame from threaded stream; stop when depleted
+			if not fvs.more():
 				break
+			frame = fvs.read()
+			if frame is None:
+				break
+			# Ensure frame has 3 color channels (some decoders may return grayscale)
+			if len(frame.shape) == 2 or (len(frame.shape) == 3 and frame.shape[2] == 1):
+				frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 			
 
 			# construct a blob from the input frame and then perform a forward
@@ -317,14 +318,18 @@ def yolo_detection_counter(vehicle_count_instance,lane,inputVideoPath,outputVide
 			# 	cv2.line(frame, (x1_line, y1_line), (x2_line, y2_line), (0, 0, 0xFF), 2)
 
 			# apply non-maxima suppression to suppress weak, overlapping
-			# bounding boxes
-			idxs = cv2.dnn.NMSBoxes(boxes, confidences, preDefinedConfidence,
-				preDefinedThreshold)
+			# bounding boxes; handle empty lists safely
+			if len(boxes) and len(confidences):
+				idxs = cv2.dnn.NMSBoxes(boxes, confidences, float(preDefinedConfidence), float(preDefinedThreshold))
+			else:
+				idxs = []
 
 			# Draw detection box 
 			drawDetectionBoxes(idxs, boxes, classIDs, confidences, frame)
 
 			vehicle_count, current_detections = count_vehicles(idxs, boxes, classIDs, vehicle_count_instance.get_count(lane), previous_frame_detections, frame)
+			# Avoid runaway increments by capping per-frame new IDs
+			vehicle_count = min(vehicle_count, 10_000)
 
 			# Display Vehicle Count if a vehicle has passed the line 
 			displayVehicleCount(frame, vehicle_count,lane)
