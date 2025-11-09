@@ -20,10 +20,11 @@ list_of_vehicles = ["bicycle","car","motorbike","bus","truck"]
 # Setting the threshold for the number of frames to search a vehicle for
 FRAMES_BEFORE_CURRENT = 10
 inputWidth, inputHeight = 416, 416
+DEFAULT_MPP = 0.05  # meters per pixel fallback when calibration not provided (kept for potential future use)
 
 #Parse command line arguments and extract the values required
 LABELS, weightsPath, configPath, inputVideoPath, outputVideoPath,\
-	preDefinedConfidence, preDefinedThreshold, USE_GPU, inputVideoPathList, outputVideoPathAll= parseCommandLineArguments()
+	preDefinedConfidence, preDefinedThreshold, USE_GPU, inputVideoPathList, outputVideoPathAll, meters_per_pixel, distance_km, speed_limit_kmh, display_advice, max_controller_seconds, max_controller_cycles = parseCommandLineArguments()
 
 # Initialize a list of colors to represent each possible class label
 np.random.seed(42)
@@ -32,7 +33,7 @@ COLORS = np.random.randint(0, 255, size=(len(LABELS), 3),
 # PURPOSE: Displays the vehicle count on the top-left corner of the frame
 # PARAMETERS: Frame on which the count is displayed, the count number of vehicles 
 # RETURN: N/A
-def displayVehicleCount(frame, vehicle_count,lane):
+def displayVehicleCount(frame, vehicle_count,lane, avg_speed_text=None, recommendation_text=None):
 	cv2.putText(
 		frame, #Image
 		'Detected Vehicles in Lane' +str(lane+1)+"::  =  "  + str(vehicle_count), #Label
@@ -43,6 +44,11 @@ def displayVehicleCount(frame, vehicle_count,lane):
 		2, #Thickness
 		cv2.FONT_HERSHEY_COMPLEX_SMALL,
 		)
+	y = 45
+	if avg_speed_text:
+		cv2.putText(frame, avg_speed_text, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+		y += 25
+	# recommendation_text removed as we no longer show speed advice
 
 # PURPOSE: Determining if the box-mid point cross the line or are within the range of 5 units
 # from the line
@@ -173,6 +179,25 @@ def count_vehicles(idxs, boxes, classIDs, vehicle_count, previous_frame_detectio
 
 	return vehicle_count, current_detections
 
+def compute_and_update_speed(lane, current_detections, prev_positions_by_id, last_seen_time_by_id, mpp, vehicle_count_instance):
+	now = time.time()
+	inst_speeds_mps = []
+	for (cx, cy), ID in current_detections.items():
+		prev_pt = prev_positions_by_id.get(ID)
+		prev_t = last_seen_time_by_id.get(ID)
+		if prev_pt is not None and prev_t is not None:
+			dt = max(now - prev_t, 1e-3)
+			dist_px = float(np.hypot(cx - prev_pt[0], cy - prev_pt[1]))
+			scale = mpp if mpp is not None else DEFAULT_MPP
+			dist_m = dist_px * scale
+			speed_mps = dist_m / dt
+			inst_speeds_mps.append(speed_mps)
+		prev_positions_by_id[ID] = (cx, cy)
+		last_seen_time_by_id[ID] = now
+	if inst_speeds_mps:
+		vehicle_count_instance.update_avg_speed(lane, float(np.median(inst_speeds_mps)))
+	return prev_positions_by_id, last_seen_time_by_id
+
 # load our YOLO object detector trained on COCO dataset (80 classes)
 # and determine only the *output* layer names that we need from YOLO
 print("[INFO] loading YOLO from disk...")
@@ -206,6 +231,15 @@ class TrackCount:
 		if not hasattr(self, "vehicle_lane_count"):
 			self.vehicle_lane_count = multiprocessing.Manager().list([0,0,0,0])
 			print(self.vehicle_lane_count)
+		if not hasattr(self, "avg_speed_mps"):
+			self.avg_speed_mps = multiprocessing.Manager().list([0.0,0.0,0.0,0.0])
+		if not hasattr(self, "schedule"):
+			self.schedule = multiprocessing.Manager().dict({
+				'current_green_lane': 1,
+				'time_left_sec': 0.0,
+				'order': [1,2,3,4],
+				'next_green_durations': [15,15,15,15]
+			})
 
 	def __new__(cls):
 		if cls._instance is None:
@@ -220,6 +254,23 @@ class TrackCount:
 
 	def get_count(self,lane):
 		return self.vehicle_lane_count[lane]
+
+	def update_avg_speed(self,lane,value_mps):
+		prev = float(self.avg_speed_mps[lane])
+		alpha = 0.2
+		self.avg_speed_mps[lane] = max(0.0, alpha*float(value_mps) + (1-alpha)*prev)
+
+	def get_avg_speed(self,lane):
+		return float(self.avg_speed_mps[lane])
+
+	def set_schedule(self, current_green_lane, time_left_sec, order, next_green_durations):
+		self.schedule['current_green_lane'] = int(current_green_lane)
+		self.schedule['time_left_sec'] = float(time_left_sec)
+		self.schedule['order'] = list(order)
+		self.schedule['next_green_durations'] = list(next_green_durations)
+
+	def get_schedule(self):
+		return dict(self.schedule)
 		
 # loop over frames from the video file stream
 
@@ -237,6 +288,8 @@ def yolo_detection_counter(vehicle_count_instance,lane,inputVideoPath,outputVide
 	y2_line = video_height//2
 	#Initialization
 	previous_frame_detections = [{(0,0):0} for i in range(FRAMES_BEFORE_CURRENT)]
+	prev_positions_by_id = {}
+	last_seen_time_by_id = {}
 	fvs = FileVideoStream(inputVideoPath).start()
 	writer = initializeVideoWriter(video_width, video_height, videoStream,outputVideoPath)
 	start_time = int(time.time())
@@ -331,8 +384,21 @@ def yolo_detection_counter(vehicle_count_instance,lane,inputVideoPath,outputVide
 			# Avoid runaway increments by capping per-frame new IDs
 			vehicle_count = min(vehicle_count, 10_000)
 
-			# Display Vehicle Count if a vehicle has passed the line 
-			displayVehicleCount(frame, vehicle_count,lane)
+			# Speed update & overlay (km/h only)
+			mpp = None
+			if meters_per_pixel is not None:
+				mpp = float(meters_per_pixel[lane])
+			prev_positions_by_id, last_seen_time_by_id = compute_and_update_speed(
+				lane, current_detections, prev_positions_by_id, last_seen_time_by_id, mpp, vehicle_count_instance
+			)
+
+			avg_speed_mps = vehicle_count_instance.get_avg_speed(lane)
+			avg_speed_text = None
+			recommendation_text = None
+			if display_advice:
+				# Always show in km/h (use DEFAULT_MPP if calibration missing)
+				avg_speed_text = f"Avg speed (km/h): {avg_speed_mps*3.6:.1f}"
+			displayVehicleCount(frame, vehicle_count,lane, avg_speed_text, None)
 			vehicle_count_instance.update_count(lane,vehicle_count)
 			# cv2.putText(frame, "Queue Size: {}".format(fvs.Q.qsize()),
 			# 	(30, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
@@ -368,21 +434,23 @@ def yolo_detection_counter(vehicle_count_instance,lane,inputVideoPath,outputVide
 
 if __name__ == '__main__':
 	vehicle_count_instance = TrackCount()
-	
-	process1 = multiprocessing.Process(target=yolo_detection_counter, args=(vehicle_count_instance,0,inputVideoPathList[0],outputVideoPathAll[0]))
-	process3 = multiprocessing.Process(target=yolo_detection_counter, args=(vehicle_count_instance,1,inputVideoPathList[1],outputVideoPathAll[1]))
-	process4 = multiprocessing.Process(target=yolo_detection_counter, args=(vehicle_count_instance,2,inputVideoPathList[2],outputVideoPathAll[2]))
-	process5 = multiprocessing.Process(target=yolo_detection_counter, args=(vehicle_count_instance,3,inputVideoPathList[3],outputVideoPathAll[3]))
-	process2 = multiprocessing.Process(target=traffic_control, args=(vehicle_count_instance,))
-	
-	process1.start()
-	process3.start()
-	process4.start()
-	process5.start()
-	process2.start()
+	processes = []
+	try:
+		processes.append(multiprocessing.Process(target=yolo_detection_counter, args=(vehicle_count_instance,0,inputVideoPathList[0],outputVideoPathAll[0])))
+		processes.append(multiprocessing.Process(target=yolo_detection_counter, args=(vehicle_count_instance,1,inputVideoPathList[1],outputVideoPathAll[1])))
+		processes.append(multiprocessing.Process(target=yolo_detection_counter, args=(vehicle_count_instance,2,inputVideoPathList[2],outputVideoPathAll[2])))
+		processes.append(multiprocessing.Process(target=yolo_detection_counter, args=(vehicle_count_instance,3,inputVideoPathList[3],outputVideoPathAll[3])))
+		processes.append(multiprocessing.Process(target=traffic_control, args=(vehicle_count_instance, max_controller_seconds, max_controller_cycles)))
 
-	process1.join()
-	process3.join()
-	process4.join()
-	process5.join()
-	process2.join()
+		for p in processes:
+			p.start()
+		for p in processes:
+			p.join()
+	except KeyboardInterrupt:
+		print("\n[MAIN] KeyboardInterrupt received. Terminating processes...")
+		for p in processes:
+			if p.is_alive():
+				p.terminate()
+		for p in processes:
+			p.join()
+		print("[MAIN] Clean shutdown complete.")
