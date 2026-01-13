@@ -2,18 +2,10 @@
 
 ## Overview
 You Only Look Once (YOLO) is a CNN architecture for performing real-time object detection. The algorithm applies a single neural network to the full image, and then divides the image into regions and predicts bounding boxes and probabilities for each region. For more detailed working of YOLO algorithm, please refer to the [YOLO paper](https://pjreddie.com/media/files/papers/YOLOv3.pdf).
-Archive Paper : https://arxiv.org/abs/2207.02696 
+
 
 This project aims to count every vehicle (motorcycle, bus, car, cycle, truck, train) detected in the input video using YOLOv7 object-detection algorithm and uses a real time Traffic control system to optimze the traffic signaling so as to lessen the impact on congestion and control emission. It takes 6 lane traffic and shows how we can route traffic in an optimized and envinormnet friendly way.
 Object detection occurs at 4 lanes in real time the Main frame Central hub runs the detection and updates the vehicles count and runs ATCS.
-
-## Authors
-- [Karthik Rao](https://github.com/karthikrao117)
-- [Sachin Kumar]()
-- [Ashima Dujeja]()
-- [Gaurav Keshwani]()
-
-
 
 ## Adaptive Traffic Control Sytem Network
  <p align="center">
